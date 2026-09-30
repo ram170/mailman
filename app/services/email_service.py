@@ -6,31 +6,55 @@ from app.config import settings
 
 class EmailService:
 
-    def send_address_review_email(
+    def send_address_validation_email(
         self,
         order_id: int,
         order_name: str | None,
-        address: str,
-        reason: str,
+        original_address: str,
+        validation_result: dict,
     ) -> None:
+        status = validation_result.get("status", "unknown")
+        validated_address = validation_result.get("validated_address")
+        failed_checks = validation_result.get("failed_checks", [])
+
+        failed_checks_text = (
+            "\n".join(f"- {check}" for check in failed_checks)
+            if failed_checks
+            else "None"
+        )
+
         message = EmailMessage()
 
-        message["Subject"] = f"Address review required - {order_name or order_id}"
+        message["Subject"] = (
+            f"Address validation {status.upper()} - "
+            f"{order_name or order_id}"
+        )
+
+        recipients = [
+                    email.strip()
+                    for email in settings.review_emails.split(",")
+                    if email.strip()
+                ]
+
         message["From"] = settings.smtp_username
-        message["To"] = settings.review_email
+        message["To"] = ", ".join(recipients)
 
         message.set_content(
             f"""
-Order requires manual address verification.
-
 Order ID: {order_id}
 Order: {order_name}
 
-Address:
-{address}
+Original address:
+{original_address}
 
-Reason:
-{reason}
+Validated address:
+{validated_address or "Not available"}
+
+Decision:
+{status.upper()}
+
+Failed checks:
+{failed_checks_text}
 """
         )
 
@@ -39,10 +63,8 @@ Reason:
             settings.smtp_port,
         ) as smtp:
             smtp.starttls()
-
             smtp.login(
                 settings.smtp_username,
                 settings.smtp_password,
             )
-
             smtp.send_message(message)

@@ -13,13 +13,13 @@ payload = {
     "name": "#1001",
     "email": "customer@example.com",
     "shipping_address": {
-        "address1": "12 Some Street",
-        "address2": "Valecherry",
+        "address1": "chandrasekarapuram",
+        "address2": "3rd street, ambattur",
         "city": "Chennai",
         "province": "Tamil Nadu",
         "country": "India",
         "country_code": "IN",
-        "zip": "600053",
+        "zip": "600063",
     },
 }
 
@@ -40,6 +40,7 @@ response = httpx.post(
         "Content-Type": "application/json",
         "X-Shopify-Hmac-SHA256": signature,
     },
+    timeout=60.0,
 )
 
 print(response.status_code)

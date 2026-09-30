@@ -1,90 +1,115 @@
+import logging
 import httpx
 
+from app.config import settings
 from app.models.address import Address
+
+
+logger = logging.getLogger(__name__)
 
 
 class AddressValidationService:
 
     async def validate(self, address: Address) -> dict:
-        if not address.zip:
+        result = await self._validate_with_google(address)
+
+        if not result:
             return {
                 "status": "review",
-                "reason": "Pincode is missing",
+                "reason": "Google Address Validation API failed",
             }
 
-        pincode_data = await self._lookup_pincode(address.zip)
+        verdict = result.get("verdict", {})
+        validated_address = result.get("address", {})
 
-        if not pincode_data:
-            return {
-                "status": "review",
-                "reason": "Pincode could not be verified",
-            }
-
-        match = self._location_matches_address(
-            address=address,
-            pincode_data=pincode_data,
+        components = validated_address.get(
+            "addressComponents",
+            []
         )
 
-        if not match:
+        formatted_address = validated_address.get(
+            "formattedAddress"
+        )
+
+        checks = {
+            "possible_next_action": (
+                verdict.get("possibleNextAction") == "ACCEPT"
+            ),
+
+            "address_complete": (
+                verdict.get("addressComplete") is True
+            ),
+
+            "premise_granularity": (
+                verdict.get("validationGranularity")
+                in {"PREMISE", "SUB_PREMISE"}
+            ),
+
+            "premise_confirmed": self._is_component_acceptable(
+                components,
+                {"premise", "subpremise"},
+                {"CONFIRMED"},
+            ),
+
+            "postal_code_confirmed": self._is_component_acceptable(
+                components,
+                {"postal_code"},
+                {"CONFIRMED"},
+            ),
+
+            "locality_confirmed": self._is_component_acceptable(
+                components,
+                {
+                    "locality",
+                    "postal_town",
+                    "administrative_area_level_2",
+                },
+                {"CONFIRMED"},
+            ),
+
+            "route_acceptable": self._is_component_acceptable(
+                components,
+                {"route"},
+                {
+                    "CONFIRMED",
+                    "UNCONFIRMED_BUT_PLAUSIBLE",
+                },
+            ),
+        }
+
+        accepted = all(checks.values())
+
+        if accepted:
             return {
-                "status": "review",
-                "reason": "Address location does not match pincode",
+                "status": "accept",
+                "validated_address": formatted_address,
+                "checks": checks,
             }
 
-        return {
-            "status": "valid",
-            "pincode": address.zip,
-            **match,
-        }
-
-    async def _lookup_pincode(self, pincode: str) -> dict | None:
-        url = f"https://api.postalpincode.in/pincode/{pincode}"
-
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(url)
-
-            if response.status_code != 200:
-                return None
-
-            data = response.json()
-
-        except (httpx.TimeoutException, httpx.RequestError):
-            return None
-
-        if not data:
-            return None
-
-        result = data[0]
-
-        if result.get("Status") != "Success":
-            return None
-
-        post_offices = result.get("PostOffice") or []
-
-        if not post_offices:
-            return None
+        failed_checks = [
+            name
+            for name, passed in checks.items()
+            if not passed
+        ]
 
         return {
-            "post_offices": [
-                {
-                    "name": office.get("Name"),
-                    "district": office.get("District"),
-                    "state": office.get("State"),
-                    "region": office.get("Region"),
-                    "division": office.get("Division"),
-                    "block": office.get("Block"),
-                }
-                for office in post_offices
-            ]
+            "status": "review",
+            "validated_address": formatted_address,
+            "failed_checks": failed_checks,
+            "checks": checks,
         }
 
-    def _location_matches_address(
+    async def _validate_with_google(
         self,
         address: Address,
-        pincode_data: dict,
     ) -> dict | None:
-        address_text = " ".join(
+
+        url = (
+            "https://addressvalidation.googleapis.com/"
+            "v1:validateAddress"
+        )
+
+        full_address = ", ".join(
             filter(
                 None,
                 [
@@ -92,23 +117,63 @@ class AddressValidationService:
                     address.address2,
                     address.city,
                     address.province,
+                    address.zip,
+                    address.country,
                 ],
             )
-        ).lower()
+        )
 
-        for office in pincode_data["post_offices"]:
-            possible_locations = [
-                office.get("name"),
-                office.get("block"),
-                office.get("district"),
-            ]
 
-            for location in possible_locations:
-                if location and location.lower() in address_text:
-                    return {
-                        "matched_location": location,
-                        "state": office.get("state"),
-                        "district": office.get("district"),
-                    }
+        payload = {
+            "address": {
+                "regionCode": "IN",
+                "addressLines": [full_address],
+            }
+        }
 
-        return None
+        logger.info(
+            "Google Address Validation request: %s",
+            payload,
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    url,
+                    params={
+                        "key": settings.google_maps_api_key,
+                    },
+                    json=payload,
+                )
+
+            logger.info(
+                "Google Address Validation response status=%s body=%s",
+                response.status_code,
+                response.text,
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            return data.get("result")
+
+        except httpx.HTTPError as exc:
+            logger.exception(
+                f"Google address validation failed: {exc}"
+            )
+            return None
+
+    def _is_component_acceptable(
+        self,
+        components: list[dict],
+        component_types: set[str],
+        allowed_levels: set[str],
+    ) -> bool:
+        for component in components:
+            if component.get("componentType") not in component_types:
+                continue
+
+            return component.get("confirmationLevel") in allowed_levels
+
+        return False
